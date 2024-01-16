@@ -3,13 +3,27 @@
 
 import numpy as np
 import logging
-import dask.array as da
+import re
+import warnings
+from collections.abc import Callable
+from typing import Any, Optional
+
+
 
 import datetime
 import isodate
+import iris
 from iris.cube import Cube
 from iris.time import PartialDateTime
+import iris.analysis
+from iris.coords import DimCoord
+
 from typing import Iterable, Optional
+from scipy.stats import mstats
+
+import dask.array as da
+
+logger = logging.getLogger(__name__)
 
 def _parse_start_date(date):
     """Parse start of the input `timerange` tag given in ISO 8601 format.
@@ -136,6 +150,208 @@ def _extract_datetime(
 
     return cube_slice
 
+def _get_period_coord(cube, period, seasons):
+    """Get periods."""
+    if period in ['hourly', 'hour', 'hr']:
+        if not cube.coords('hour'):
+            iris.coord_categorisation.add_hour(cube, 'time')
+        return cube.coord('hour')
+    if period in ['daily', 'day']:
+        if not cube.coords('day_of_year'):
+            iris.coord_categorisation.add_day_of_year(cube, 'time')
+        return cube.coord('day_of_year')
+    if period in ['monthly', 'month', 'mon']:
+        if not cube.coords('month_number'):
+            iris.coord_categorisation.add_month_number(cube, 'time')
+        return cube.coord('month_number')
+    if period in ['seasonal', 'season']:
+        if not cube.coords('season_number'):
+            iris.coord_categorisation.add_season_number(cube,
+                                                        'time',
+                                                        seasons=seasons)
+        return cube.coord('season_number')
+    raise ValueError(f"Period '{period}' not supported")
+
+def _aggregate_time_fx(result_cube, source_cube):
+    time_dim = set(source_cube.coord_dims(source_cube.coord('time')))
+    if source_cube.cell_measures():
+        for measure in source_cube.cell_measures():
+            measure_dims = set(source_cube.cell_measure_dims(measure))
+            if time_dim.intersection(measure_dims):
+                logger.debug('Averaging time dimension in measure %s.',
+                             measure.var_name)
+                result_measure = da.mean(measure.core_data(),
+                                         axis=tuple(time_dim))
+                measure = measure.copy(result_measure)
+                measure_dims = tuple(measure_dims - time_dim)
+                result_cube.add_cell_measure(measure, measure_dims)
+
+    if source_cube.ancillary_variables():
+        for ancillary_var in source_cube.ancillary_variables():
+            ancillary_dims = set(
+                source_cube.ancillary_variable_dims(ancillary_var))
+            if time_dim.intersection(ancillary_dims):
+                logger.debug(
+                    'Averaging time dimension in ancillary variable %s.',
+                    ancillary_var.var_name)
+                result_ancillary_var = da.mean(ancillary_var.core_data(),
+                                               axis=tuple(time_dim))
+                ancillary_var = ancillary_var.copy(result_ancillary_var)
+                ancillary_dims = tuple(ancillary_dims - time_dim)
+                result_cube.add_ancillary_variable(ancillary_var,
+                                                   ancillary_dims)
+
+def aggregator_accept_weights(aggregator: iris.analysis.Aggregator) -> bool:
+    """Check if aggregator support weights.
+
+    Parameters
+    ----------
+    aggregator:
+        Aggregator to check.
+
+    Returns
+    -------
+    bool
+        ``True`` if aggregator support weights, ``False`` otherwise.
+
+    """
+    weighted_aggregators_cls = (
+        iris.analysis.WeightedAggregator,
+        iris.analysis.WeightedPercentileAggregator,
+    )
+    return isinstance(aggregator, weighted_aggregators_cls)
+
+def update_weights_kwargs(
+    aggregator: iris.analysis.Aggregator,
+    kwargs: dict,
+    weights: Any,
+    cube: Optional[Cube] = None,
+    callback: Optional[Callable] = None,
+    **callback_kwargs,
+) -> dict:
+    """Update weights keyword argument.
+
+    Parameters
+    ----------
+    aggregator:
+        Iris aggregator.
+    kwargs:
+        Keyword arguments to update.
+    weights:
+        Object which will be used as weights if supported and desired.
+    cube:
+        Cube which can be updated through the callback (if not None) if weights
+        are used.
+    callback:
+        Optional callback function with signature `f(cube: iris.cube.Cube,
+        **kwargs) -> None`. Should update the cube given to this function
+        in-place. Is called only when weights are used and cube is not None.
+    **callback_kwargs:
+        Optional keyword arguments passed to `callback`.
+
+    Returns
+    -------
+    dict
+        Updated keyword arguments.
+
+    """
+    kwargs = dict(kwargs)
+    if aggregator_accept_weights(aggregator) and kwargs.get('weights', True):
+        kwargs['weights'] = weights
+        if cube is not None and callback is not None:
+            callback(cube, **callback_kwargs)
+    else:
+        kwargs.pop('weights', None)
+    return kwargs
+
+def get_iris_aggregator(
+    operator: str,
+    **operator_kwargs,
+) -> tuple[iris.analysis.Aggregator, dict]:
+    """Get :class:`iris.analysis.Aggregator` and keyword arguments.
+
+    Supports all available aggregators in :mod:`iris.analysis`.
+
+    Parameters
+    ----------
+    operator:
+        A named operator that is used to search for aggregators. Will be
+        capitalized before searching for aggregators, i.e., `MEAN` **and**
+        `mean` will find :const:`iris.analysis.MEAN`.
+    **operator_kwargs:
+        Optional keyword arguments for the aggregator.
+
+    Returns
+    -------
+    tuple[iris.analysis.Aggregator, dict]
+        Object that can be used within :meth:`iris.cube.Cube.collapsed`,
+        :meth:`iris.cube.Cube.aggregated_by`, or
+        :meth:`iris.cube.Cube.rolling_window` and the corresponding keyword
+        arguments.
+
+    Raises
+    ------
+    ValueError
+        An invalid `operator` is specified, i.e., it is not found in
+        :mod:`iris.analysis` or the returned object is not an
+        :class:`iris.analysis.Aggregator`.
+
+    """
+    cap_operator = operator.upper()
+    aggregator_kwargs = dict(operator_kwargs)
+
+    # Deprecations
+    if cap_operator == 'STD':
+        msg = (
+            f"The operator '{operator}' for computing the standard deviation "
+            f"has been deprecated in ESMValCore version 2.10.0 and is "
+            f"scheduled for removal in version 2.12.0. Please use 'std_dev' "
+            f"instead. This is an exact replacement."
+        )
+        warnings.warn(msg, ESMValCoreDeprecationWarning)
+        operator = 'std_dev'
+        cap_operator = 'STD_DEV'
+    elif re.match(r"^(P\d{1,2})(\.\d*)?$", cap_operator):
+        msg = (
+            f"Specifying percentile operators with the syntax 'pXX.YY' (here: "
+            f"'{operator}') has been deprecated in ESMValCore version 2.10.0 "
+            f"and is scheduled for removal in version 2.12.0. Please use "
+            f"`operator='percentile'` with the keyword argument "
+            f"`percent=XX.YY` instead. Example: `percent=95.0` for 'p95.0'. "
+            f"This is an exact replacement."
+        )
+        warnings.warn(msg, ESMValCoreDeprecationWarning)
+        aggregator_kwargs['percent'] = float(operator[1:])
+        operator = 'percentile'
+        cap_operator = 'PERCENTILE'
+
+    # Check if valid aggregator is found
+    if not hasattr(iris.analysis, cap_operator):
+        raise ValueError(
+            f"Aggregator '{operator}' not found in iris.analysis module"
+        )
+    aggregator = getattr(iris.analysis, cap_operator)
+    if not hasattr(aggregator, 'aggregate'):
+        raise ValueError(
+            f"Aggregator {aggregator} found by '{operator}' is not a valid "
+            f"iris.analysis.Aggregator"
+        )
+
+    # Use dummy cube to check if aggregator_kwargs are valid
+    x_coord = DimCoord([1.0], bounds=[0.0, 2.0], var_name='x')
+    cube = Cube([0.0], dim_coords_and_dims=[(x_coord, 0)])
+    test_kwargs = update_weights_kwargs(
+        aggregator, aggregator_kwargs, np.array([1.0])
+    )
+    try:
+        cube.collapsed('x', aggregator, **test_kwargs)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(
+            f"Invalid kwargs for operator '{operator}': {str(exc)}"
+        )
+
+    return (aggregator, aggregator_kwargs)
+
 def clip_timerange(cube: Cube, timerange: str) -> Cube:
     """Extract time range with a resolution up to seconds.
 
@@ -192,7 +408,73 @@ def clip_timerange(cube: Cube, timerange: str) -> Cube:
 
     return _extract_datetime(cube, t_1, t_2)
 
-def detrend_theil_sen(data, axis=-1, type='linear', bp=0, overwrite_data=False):
+def extract_time(
+    cube: Cube,
+    start_year: int,
+    start_month: int,
+    start_day: int,
+    end_year: int,
+    end_month: int,
+    end_day: int,
+) -> Cube:
+    """Extract a time range from a cube.
+
+    Given a time range passed in as a series of years, months and days, it
+    returns a time-extracted cube with data only within the specified
+    time range.
+
+    Parameters
+    ----------
+    cube:
+        Input cube.
+    start_year:
+        Start year.
+    start_month:
+        Start month.
+    start_day:
+        Start day.
+    end_year:
+        End year.
+    end_month:
+        End month.
+    end_day:
+        End day.
+
+    Returns
+    -------
+    iris.cube.Cube
+        Sliced cube.
+
+    Raises
+    ------
+    ValueError
+        Time ranges are outside the cube time limits.
+
+    """
+    t_1 = PartialDateTime(year=int(start_year),
+                          month=int(start_month),
+                          day=int(start_day))
+    t_2 = PartialDateTime(year=int(end_year),
+                          month=int(end_month),
+                          day=int(end_day))
+
+    return _extract_datetime(cube, t_1, t_2)
+
+def theil_sen_estimator(x, y):
+    n = len(x)
+    slopes = []
+
+    for i in range(n-1):
+        for j in range(i+1, n):
+            slopes.append((y[j] - y[i]) / (x[j] - x[i]))
+
+    median_slope = np.median(slopes)
+    median_intercept = np.median(y - median_slope * x)
+
+    return median_slope, median_intercept
+
+
+def detrend_theil_sen(data, axis=0, type='linear', bp=0, overwrite_data=False):
     """
     Remove linear trend along axis from data using Theil-Sen slopes.
 
@@ -202,7 +484,7 @@ def detrend_theil_sen(data, axis=-1, type='linear', bp=0, overwrite_data=False):
         The input data.
     axis : int, optional
         The axis along which to detrend the data. By default, this is the
-        last axis (-1).
+        first axis (0).
     type : {'linear', 'constant'}, optional
         The type of detrending. If ``type == 'linear'`` (default),
         the result of a Theil-Sen fit to `data` is subtracted from `data`.
@@ -261,11 +543,32 @@ def detrend_theil_sen(data, axis=-1, type='linear', bp=0, overwrite_data=False):
         # Find Theil-Sen fit and remove it for each piece
         for m in range(len(bp) - 1):
             sl = range(bp[m], bp[m + 1])  # Convert slice to range
-            x = np.arange(1, len(sl) + 1, dtype=dtype) / len(sl)
+            #x = np.arange(1, len(sl) + 1, dtype=dtype)
             y = newdata[sl]
-            slopes = np.diff(y) / np.diff(x)
+            
+            # Calculate Theil-Sen fit across all data points
+            
+            #dif_y = np.diff(y.flatten())
+            #dif_x = np.diff(x)
+            #slopes = dif_y/dif_x
+            #slopes = np.array(slopes)
+            y = np.array(y).flatten()
+            x = np.arange(len(y), dtype=float)
+            # Compute sorted slopes only when deltax > 0
+            deltax = x[:, np.newaxis] - x
+            deltay = y[:, np.newaxis] - y
+            slopes = deltay[deltax > 0] / deltax[deltax > 0]
+            slopes.sort()
+
             median_slope = np.median(slopes)
-            newdata[sl] = y - median_slope * x
+            intercept = np.median(y) - median_slope * np.median(x)
+            y = newdata[sl]
+
+            # Calculate trend
+            trend = median_slope * x + intercept
+            trend = trend.reshape(N, -1)
+            # Remove trend from data
+            newdata[sl] = y - trend
 
         # Put data back in the original shape.
         newdata = newdata.reshape(newdata_shape)
@@ -476,4 +779,33 @@ def anomalies(
         cube.data = cube.core_data() / da.concatenate(
             [cube_stddev.core_data() for _ in range(int(reps))], axis=tdim)
         cube.units = '1'
+    return cube
+
+def _compute_anomalies(
+    cube: Cube,
+    reference: Cube,
+    period: str,
+    seasons: Iterable[str],
+):
+    cube_coord = _get_period_coord(cube, period, seasons)
+    ref_coord = _get_period_coord(reference, period, seasons)
+    indices = np.empty_like(cube_coord.points, dtype=np.int32)
+    for idx, point in enumerate(ref_coord.points):
+        indices = np.where(cube_coord.points == point, idx, indices)
+    ref_data = reference.core_data()
+    axis, = cube.coord_dims(cube_coord)
+    if cube.has_lazy_data() and reference.has_lazy_data():
+        # Rechunk reference data because iris.cube.Cube.aggregate_by, used to
+        # compute the reference, produces very small chunks.
+        # https://github.com/SciTools/iris/issues/5455
+        ref_chunks = tuple(
+            -1 if i == axis else chunk
+            for i, chunk in enumerate(cube.lazy_data().chunks)
+        )
+        ref_data = ref_data.rechunk(ref_chunks)
+    with dask.config.set({"array.slicing.split_large_chunks": True}):
+        ref_data_broadcast = da.take(ref_data, indices=indices, axis=axis)
+    data = cube.core_data() - ref_data_broadcast
+    cube = cube.copy(data)
+    cube.remove_coord(cube_coord)
     return cube
