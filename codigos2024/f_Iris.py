@@ -809,3 +809,4 @@ def _compute_anomalies(
     cube = cube.copy(data)
     cube.remove_coord(cube_coord)
     return cube
+
